@@ -1,0 +1,69 @@
+# AWS CodeBuild 빌드 명세서
+# 흐름: 검사(lint) → Docker 이미지 빌드·ECR push → 정적 파일 S3 업로드 → GitOps 저장소 이미지 태그 변경
+# 아래 변수는 CodeBuild 프로젝트(Terraform)가 넣어 준다:
+#   AWS_DEFAULT_REGION(자동), ECR_REGISTRY, ASSETS_BUCKET, GITOPS_REPO_URL, COMMIT_ID(CodePipeline)
+version: 0.2
+
+env:
+  variables:
+    IMAGE_REPO_NAME: next-app
+    KUSTOMIZE_VERSION: v5.8.1
+  secrets-manager:
+    # Secrets Manager 의 "next-app/ci" 시크릿(JSON) 안 GITOPS_TOKEN 키
+    GITOPS_TOKEN: next-app/ci:GITOPS_TOKEN
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 24
+    commands:
+      # GitOps 저장소의 이미지 태그를 바꿀 kustomize (CodeBuild 이미지에 기본 설치 X)
+      - curl -sSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F${KUSTOMIZE_VERSION}/kustomize_${KUSTOMIZE_VERSION}_linux_arm64.tar.gz" | tar xz -C /usr/local/bin kustomize
+      - kustomize version
+
+  pre_build:
+    commands:
+      # 이미지 태그 = git 커밋 SHA 앞 7자리 (어떤 코드가 배포됐는지 바로 추적 가능)
+      - IMAGE_TAG=$(echo "$COMMIT_ID" | cut -c1-7)
+      - IMAGE_URI="$ECR_REGISTRY/$IMAGE_REPO_NAME:$IMAGE_TAG"
+      - CACHE_REF="$ECR_REGISTRY/$IMAGE_REPO_NAME-cache:buildcache"
+      - echo "IMAGE_URI=$IMAGE_URI"
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+      # 빠른 실패: 코드 검사가 깨지면 이미지까지 가지 않는다
+      - npm ci --no-audit --no-fund
+      - npm run lint
+
+  build:
+    commands:
+      # 레이어 캐시를 ECR 에 저장/재사용하려면 docker-container 드라이버 빌더가 필요
+      - docker buildx create --name ci --driver docker-container --use
+      - >-
+        docker buildx build
+        --platform linux/arm64
+        --target runner
+        --build-arg APP_VERSION="$IMAGE_TAG"
+        --cache-from type=registry,ref="$CACHE_REF"
+        --cache-to type=registry,ref="$CACHE_REF",mode=max,image-manifest=true,oci-mediatypes=true
+        --tag "$IMAGE_URI"
+        --push .
+      # 같은 빌드 결과(캐시)에서 정적 파일만 꺼낸다 → 이미지 속 파일과 해시가 100% 같다
+      - docker buildx build --platform linux/arm64 --build-arg APP_VERSION="$IMAGE_TAG" --target static-assets --output type=local,dest=static-out .
+
+  post_build:
+    commands:
+      # 빌드가 실패했으면 여기서 멈춘다 (post_build 는 build 실패해도 실행되기 때문)
+      - '[ "$CODEBUILD_BUILD_SUCCEEDING" = "1" ] || exit 1'
+      # ① 정적 파일 먼저 올린다 (새 HTML 이 참조할 JS/CSS 가 먼저 있어야 함). 옛 버전 파일은 지우지 않는다
+      - aws s3 cp static-out/_next/static "s3://$ASSETS_BUCKET/_next/static" --recursive --only-show-errors --cache-control "public,max-age=31536000,immutable"
+      # ② GitOps 저장소의 dev 이미지 태그 변경 → Argo CD 가 감지해서 배포
+      - AUTH_URL=$(echo "$GITOPS_REPO_URL" | sed "s#://#://x-access-token:${GITOPS_TOKEN}@#")
+      - git clone --depth 1 "$AUTH_URL" gitops
+      - (cd gitops/apps/next-app/overlays/dev && kustomize edit set image "next-app=$IMAGE_URI")
+      - git -C gitops config user.name "codebuild-bot"
+      - git -C gitops config user.email "codebuild-bot@users.noreply.github.com"
+      - 'git -C gitops commit -am "deploy(dev): next-app $IMAGE_TAG"'
+      - git -C gitops pull --rebase && git -C gitops push
+
+cache:
+  paths:
+    - /root/.npm/**/*
